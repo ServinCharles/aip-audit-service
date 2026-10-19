@@ -1,0 +1,151 @@
+name: CI
+
+# Mirrors the Jenkins build pipeline (Jenkinsfile), then runs the service against real Kafka and MongoDB containers.
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.58.1
+  KAFKA_IMAGE: apache/kafka:3.8.0
+  MONGO_IMAGE: mongo:7.0
+
+jobs:
+  build-test:
+    name: Build and unit test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit and endpoint tests (same command as Jenkins, in the .NET SDK container)
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm -e OWNER="$(id -u):$(id -g)" \
+            -v "$PWD":/src -w /src mcr.microsoft.com/dotnet/sdk:8.0 bash -ceu '
+              trap "chown -R $OWNER /src" EXIT
+              dotnet test tests/AipAuditService.Tests -c Release \
+                --logger "trx;LogFileName=unit-tests.trx" \
+                --logger "junit;LogFilePath=/src/TestResults/junit/unit-tests.xml" \
+                --collect:"XPlat Code Coverage;Format=cobertura,opencover" \
+                --results-directory /src/TestResults
+            ' 2>&1 | tee test-output.log
+      - name: Show test errors
+        if: failure()
+        run: grep -iE "error|fail|exception" test-output.log | head -10 | sed 's/^/::error::/'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: TestResults/
+
+  image:
+    name: Image, event-flow tests on Kafka + MongoDB, Trivy scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runtime image for EKS (linux/amd64)
+        run: docker build --platform linux/amd64 -t aip-audit-service:ci .
+      - name: Build runtime image for Apple Silicon (linux/arm64, cross-compiled)
+        run: docker buildx build --platform linux/arm64 -t aip-audit-service:ci-arm64 .
+
+      - name: Start Kafka and MongoDB, create the topics
+        run: |
+          docker network create aip
+          docker run -d --name mongodb --network aip "$MONGO_IMAGE"
+          docker run -d --name kafka --network aip \
+            -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            "$KAFKA_IMAGE"
+          KT="docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092"
+          for attempt in $(seq 1 30); do $KT --list > /dev/null 2>&1 && break; sleep 2; done
+          $KT --create --if-not-exists --topic aip.decisions --partitions 3 --replication-factor 1
+          $KT --create --if-not-exists --topic aip.decisions.dlq --partitions 1 --replication-factor 1
+
+      - name: Event-flow tests (stored, duplicate, dead-letter, restart catch-up)
+        shell: bash
+        run: |
+          set -euo pipefail
+          produce() { # key|json
+            echo "$1" | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+              --topic aip.decisions --property parse.key=true --property key.separator='|'
+          }
+          event() { # eventId applicationId decision
+            echo "$2|{\"eventId\":\"$1\",\"eventType\":\"AipDecisionMade\",\"schemaVersion\":1,\"occurredAt\":\"2026-10-19T11:30:00Z\",\"applicationId\":\"$2\",\"decision\":\"$3\",\"loanAmount\":150000,\"maxBorrowing\":150000}"
+          }
+          count() { curl -sSf "http://localhost:8080/api/audit/$1" | jq '.events | length'; }
+          wait_for() { # applicationId expectedCount: waits for the count, then checks it stays there
+            for attempt in $(seq 1 30); do
+              if [ "$(count "$1")" = "$2" ]; then
+                sleep 3
+                [ "$(count "$1")" = "$2" ] && return 0
+              fi
+              sleep 1
+            done
+            echo "::error::Expected $2 audited events for $1, got $(count "$1")"; return 1
+          }
+          has_event() { curl -sSf "http://localhost:8080/api/audit/$1" | jq -e --arg id "$2" 'any(.events[]; .eventId == $id)' > /dev/null; }
+          start_service() {
+            docker run -d --name aip-audit-service --network aip -p 8080:8080 \
+              -e MONGODB_URI=mongodb://mongodb:27017 -e KAFKA_BOOTSTRAP_SERVERS=kafka:9092 \
+              aip-audit-service:ci
+            for attempt in $(seq 1 30); do curl -sf http://localhost:8080/health > /dev/null && return 0; sleep 1; done
+            return 1
+          }
+
+          start_service
+
+          echo "== 1. A valid event is audited"
+          produce "$(event e-001 AIP-20261019-0000000A Accepted)"
+          wait_for AIP-20261019-0000000A 1
+          curl -sSf http://localhost:8080/api/audit/AIP-20261019-0000000A | jq .
+
+          echo "== 2. The same event delivered twice is stored once"
+          produce "$(event e-001 AIP-20261019-0000000A Accepted)"
+          produce "$(event e-002 AIP-20261019-0000000A Referred)"   # a later, different event as a marker
+          wait_for AIP-20261019-0000000A 2
+          has_event AIP-20261019-0000000A e-002   # the marker arrived, so the duplicate was handled and ignored
+
+          echo "== 3. A broken event goes to the dead-letter topic and doesn't block the next one"
+          produce "AIP-20261019-0000000B|{not json"
+          produce "$(event e-003 AIP-20261019-0000000B Declined)"
+          wait_for AIP-20261019-0000000B 1
+          docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+            --topic aip.decisions.dlq --from-beginning --max-messages 1 --timeout-ms 20000 \
+            --property print.headers=true | tee dlq.txt
+          grep -q "dlq-reason:Not valid JSON" dlq.txt
+
+          echo "== 4. Events sent while the service is down are caught up from its committed offset"
+          docker stop aip-audit-service && docker rm aip-audit-service
+          produce "$(event e-004 AIP-20261019-0000000C Accepted)"
+          produce "$(event e-005 AIP-20261019-0000000C Referred)"
+          start_service
+          wait_for AIP-20261019-0000000C 2
+
+          echo "== Consumer group lag after catching up"
+          docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group aip-audit
+      - name: Show service logs
+        if: always()
+        run: docker logs aip-audit-service 2>&1 | tail -40 || true
+
+      - name: Trivy image scan (same gate as Jenkins)
+        run: |
+          mkdir -p reports
+          TRIVY="docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ -v $PWD/reports:/reports $TRIVY_IMAGE"
+          $TRIVY image --no-progress --format json --output /reports/trivy-aip-audit-service.json aip-audit-service:ci
+          $TRIVY image --no-progress --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed aip-audit-service:ci
+      - name: Summarise vulnerabilities
+        if: failure()
+        run: |
+          jq -r '.Results[]? | .Target as $t | .Vulnerabilities[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL") | select(.FixedVersion != null and .FixedVersion != "") | "::error title=\(.Severity) \(.VulnerabilityID)::\($t): \(.PkgName) \(.InstalledVersion) -> fix \(.FixedVersion)"' reports/*.json | sort -u | head -10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: reports/
