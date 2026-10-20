@@ -1,0 +1,64 @@
+name: CI failure triage
+
+# When the CI workflow fails, open (or update) an issue with the failing job,
+# step and error annotations, ready to hand to Copilot or a person to fix.
+#
+# This workflow can ONLY read CI results and write issues. It cannot push code,
+# open or approve pull requests, or merge anything: every fix goes through a
+# pull request that a human reviews and merges.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  actions: read
+  checks: read
+  issues: write
+  contents: read        # no push
+  pull-requests: none   # no PRs, approvals or merges
+
+jobs:
+  triage:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open or update an issue for the failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const { owner, repo } = context.repo;
+
+            // Which jobs and steps failed, with their error annotations
+            const jobs = (await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id })).data.jobs;
+            const failed = jobs.filter(j => j.conclusion === 'failure');
+
+            let details = '';
+            for (const job of failed) {
+              const steps = (job.steps || []).filter(s => s.conclusion === 'failure').map(s => s.name);
+              details += `### ${job.name}\nFailed step: ${steps.join(', ') || 'unknown'}\n`;
+              const notes = (await github.rest.checks.listAnnotations({ owner, repo, check_run_id: job.id })).data
+                .filter(a => a.annotation_level === 'failure').slice(0, 10);
+              for (const a of notes) details += `- ${a.message}\n`;
+              details += '\n';
+            }
+
+            const title = `CI failed: ${failed.map(j => j.name).join(', ') || 'CI'} on ${run.head_branch}`;
+            const body = [
+              `CI run [#${run.run_number}](${run.html_url}) failed on \`${run.head_branch}\` (commit ${run.head_sha.slice(0, 7)}).`,
+              '',
+              details,
+              `**To fix:** find the cause from the errors above, fix it on a new branch, open a pull request and request a review from @${owner}. Keep the change minimal and make CI green.`,
+              '',
+              `**Do not merge.** A human (@${owner}) must review and approve the pull request and merge it.`
+            ].join('\n');
+
+            // One open issue per branch: add a comment instead of creating duplicates
+            const existing = (await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'ci-failure' })).data
+              .find(i => i.title.endsWith(`on ${run.head_branch}`));
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body, labels: ['ci-failure'] });
+            }

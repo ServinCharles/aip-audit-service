@@ -11,6 +11,7 @@
   <ItemGroup>
     <PackageReference Include="Confluent.Kafka" Version="2.6.0" />
     <PackageReference Include="MongoDB.Driver" Version="3.0.0" />
+    <!-- Pinned above the version MongoDB.Driver pulls in (1.0.0, CVE-2026-44302 HIGH) -->
     <PackageReference Include="Snappier" Version="1.3.1" />
   </ItemGroup>
 
