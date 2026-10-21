@@ -24,7 +24,7 @@ pipeline {
         booleanParam(name: 'RUN_SNYK', defaultValue: false, description: 'Snyk dependency scan (needs the snyk-token credential)')
         choice(name: 'IMAGE_SCANNER', choices: ['trivy', 'twistlock'], description: 'Container image scanner. twistlock needs twistcli on PATH and the prisma-cloud credential')
         string(name: 'PRISMA_CONSOLE_URL', defaultValue: '', description: 'Prisma Cloud (Twistlock) console URL, only for IMAGE_SCANNER=twistlock')
-        string(name: 'PLATFORM', defaultValue: 'linux/amd64', description: 'Image platform: linux/amd64 for EKS, linux/arm64 for local Kubernetes on Apple Silicon')
+        string(name: 'PLATFORM', defaultValue: 'auto', description: 'Image platform. auto = linux/amd64 when pushing to ECR (EKS), otherwise the local Docker engine architecture (linux/arm64 on Apple Silicon colima). Or set linux/amd64 or linux/arm64')
         booleanParam(name: 'PUSH_TO_ECR', defaultValue: false, description: 'Push the scanned image to Amazon ECR (needs the aws-credentials credential)')
         string(name: 'AWS_REGION', defaultValue: 'eu-west-2', description: 'AWS region of the ECR repository')
         booleanParam(name: 'TRIGGER_DEPLOY', defaultValue: false, description: 'After a successful build, deploy this image to sit-01 with the AIP Deployment Pipeline')
@@ -48,9 +48,10 @@ pipeline {
                 script {
                     env.IMAGE_TAG = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                     env.IMAGE = "${env.SERVICE}:${env.IMAGE_TAG}"
-                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.IMAGE_TAG}"
+                    env.IMAGE_PLATFORM = resolvePlatform()
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.IMAGE_TAG} ${env.IMAGE_PLATFORM}"
                 }
-                echo "Building ${env.IMAGE}"
+                echo "Building ${env.IMAGE} for ${env.IMAGE_PLATFORM}"
             }
         }
 
@@ -123,7 +124,7 @@ pipeline {
         stage('Docker Build') {
             steps {
                 sh '''
-                    docker build --platform "$PLATFORM" \
+                    docker build --platform "$IMAGE_PLATFORM" \
                       --label "org.opencontainers.image.revision=$GIT_COMMIT" \
                       --label "org.opencontainers.image.source=$GIT_URL" \
                       -t "$IMAGE" .
@@ -213,4 +214,20 @@ def pushToEcr() {
         echo "IMAGE=$REGISTRY/$IMAGE" > ecr-image.properties
     '''
     archiveArtifacts artifacts: 'ecr-image.properties'
+}
+
+// Image platform for this build. "auto": an image pushed to ECR is linux/amd64 (the EKS nodes);
+// a local-only image matches the local Docker engine (colima on Apple Silicon is arm64).
+// An amd64 .NET image on an arm64 cluster runs under CPU emulation, which .NET doesn't support:
+// it starts, then the Kafka consumer hangs and the pods run out of memory.
+def resolvePlatform() {
+    def requested = params.PLATFORM?.trim()
+    if (requested && requested != 'auto') {
+        return requested
+    }
+    if (params.PUSH_TO_ECR) {
+        return 'linux/amd64'
+    }
+    def arch = sh(script: "docker info --format '{{.Architecture}}'", returnStdout: true).trim()
+    return (arch in ['aarch64', 'arm64']) ? 'linux/arm64' : 'linux/amd64'
 }
